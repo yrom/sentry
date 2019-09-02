@@ -137,11 +137,17 @@ void main() {
         clock: fakeClockProvider,
         uuidGenerator: () => 'X' * 32,
         compressPayload: compressPayload,
-        environmentAttributes: const Event(
-          serverName: 'test.server.com',
-          release: '1.2.3',
-          environment: 'staging',
-        ),
+        environmentAttributes: Event(
+            serverName: 'test.server.com',
+            release: '1.2.3',
+            environment: 'staging',
+            contexts: {
+              'os': {
+                'name': Platform.operatingSystem,
+                'version': Platform.operatingSystemVersion
+              },
+              'app': {'name': 'test', 'start_time': 1000},
+            }),
       );
 
       try {
@@ -203,6 +209,13 @@ void main() {
         'server_name': 'test.server.com',
         'release': '1.2.3',
         'environment': 'staging',
+        'contexts': {
+          'os': {
+            'name': Platform.operatingSystem,
+            'version': Platform.operatingSystemVersion
+          },
+          'app': {'name': 'test', 'start_time': 1000},
+        }
       });
 
       await client.close();
@@ -326,6 +339,65 @@ void main() {
 
       await client.close();
     });
+
+    test('$Event contexts overrides', () async {
+      final MockClient httpMock = new MockClient();
+      final ClockProvider fakeClockProvider =
+          () => new DateTime.utc(2017, 1, 2);
+
+      int startTime;
+      httpMock.answerWith((Invocation invocation) async {
+        if (invocation.memberName == #close) {
+          return null;
+        }
+        if (invocation.memberName == #post) {
+          // parse the body and detect which user context was sent
+          var bodyData = invocation.namedArguments[new Symbol("body")];
+          var decoded = new Utf8Codec().decode(bodyData);
+          var decodedJson = new JsonDecoder().convert(decoded);
+          startTime = decodedJson['contexts']['app']['app_start_time'];
+          return new Response('{"id": "test-event-id"}', 200);
+        }
+        fail('Unexpected invocation of ${invocation.memberName} in HttpMock');
+      });
+
+      var contexts = const {
+        'app': {'app_start_time': 1000}
+      };
+
+      var overrideContexts = const {
+        'app': {'app_start_time': 1200}
+      };
+      final SentryClient client = new SentryClient(
+        dsn: _testDsn,
+        httpClient: httpMock,
+        clock: fakeClockProvider,
+        uuidGenerator: () => 'X' * 32,
+        compressPayload: false,
+        environmentAttributes: Event(
+            serverName: 'test.server.com',
+            release: '1.2.3',
+            environment: 'staging',
+            contexts: contexts),
+      );
+
+      try {
+        throw new ArgumentError('Test error');
+      } catch (error, stackTrace) {
+        final eventWithoutContext =
+            new Event(exception: error, stackTrace: stackTrace);
+        final eventWithContext = new Event(
+            exception: error,
+            stackTrace: stackTrace,
+            contexts: overrideContexts);
+        await client.capture(event: eventWithoutContext);
+        expect(startTime, contexts['app']['app_start_time']);
+        await client.capture(event: eventWithContext);
+        expect(startTime, overrideContexts['app']['app_start_time']);
+      }
+
+      await client.close();
+    });
   });
 
   group('$Event', () {
@@ -336,9 +408,19 @@ void main() {
           email: "email@email.com",
           ipAddress: "127.0.0.1",
           extras: {"foo": "bar"});
+
+      final contexts = {
+        'os': {'name': 'os_name', 'version': 1.1},
+      };
+      final breadcrumbs = [
+        Breadcrumb("test log", DateTime.fromMillisecondsSinceEpoch(1200 * 1000),
+            level: SeverityLevel.debug, category: "test"),
+      ];
+
       expect(
         new Event(
           message: 'test-message',
+          transaction: '/test/1',
           exception: new StateError('test-error'),
           level: SeverityLevel.debug,
           culprit: 'Professor Moriarty',
@@ -352,11 +434,14 @@ void main() {
           },
           fingerprint: <String>[Event.defaultFingerprint, 'foo'],
           userContext: user,
+          breadcrumbs: breadcrumbs,
+          contexts: contexts,
         ).toJson(),
         <String, dynamic>{
           'platform': 'dart',
           'sdk': {'version': sdkVersion, 'name': 'dart'},
           'message': 'test-message',
+          'transaction': '/test/1',
           'exception': [
             {'type': 'StateError', 'value': 'Bad state: test-error'}
           ],
@@ -372,6 +457,19 @@ void main() {
             'ip_address': '127.0.0.1',
             'extras': {'foo': 'bar'}
           },
+          'breadcrumbs': {
+            'values': [
+              {
+                'timestamp': 1200,
+                'message': 'test log',
+                'category': 'test',
+                'level': 'debug',
+              },
+            ]
+          },
+          'contexts': {
+            'os': {'name': 'os_name', 'version': 1.1},
+          }
         },
       );
     });
